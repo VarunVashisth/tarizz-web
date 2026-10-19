@@ -3,7 +3,6 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
-  distDir: "build",
   outputFileTracingRoot: process.cwd(),
   experimental: { optimizePackageImports: ["lucide-react"] },
   async headers() {
