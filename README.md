@@ -16,6 +16,7 @@ Tarizz Web is the browser companion for the Tarizz desktop project manager. It p
 3. Open the Supabase SQL editor and run the migrations in order:
    - `supabase/migrations/0001_initial.sql`
    - `supabase/migrations/0002_security_limits_and_optimized_media.sql`
+   - `supabase/migrations/0003_dashboard_performance.sql`
 4. Copy `.env.example` to `.env.local` and fill in the project URL and publishable key.
 5. In Supabase Auth, enable email/password and Google.
 6. Add `http://localhost:3000/auth/callback` to the allowed redirect URLs.

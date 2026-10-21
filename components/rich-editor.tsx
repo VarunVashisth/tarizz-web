@@ -22,10 +22,12 @@ import { ALLOWED_ATTACHMENT_TYPES, formatBytes, validateAttachment } from "@/lib
 import { optimizeImage } from "@/lib/image-optimization";
 import { Modal } from "./modal";
 import { downloadBlob } from "@/lib/tarizz-archive";
+import { cachedClientQuery, invalidateClientQuery } from "@/lib/client-query-cache";
 
 const lowlight = createLowlight(common);
 const EMPTY = { type: "doc", content: [{ type: "paragraph" }] };
 type SignedUrl = { path?: string; signedUrl?: string };
+type EditorPayload = { document: DocumentRecord; attachments: Attachment[]; signedUrls: Record<string, string> };
 
 function Tool({ title, active, onClick, children }: { title: string; active?: boolean; onClick: () => void; children: React.ReactNode }) {
   return <button type="button" className={`tool-btn ${active ? "active" : ""}`} title={title} aria-label={title} aria-pressed={active} onClick={onClick}>{children}</button>;
@@ -65,6 +67,7 @@ export function RichEditor({ node, onRenamed }: { node: ProjectNode; onRenamed: 
   const savingRef = useRef(false);
   const queuedSaveRef = useRef(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const cacheKeyRef = useRef("");
 
   async function persist(active: Editor) {
     if (!loadedRef.current) return;
@@ -76,7 +79,7 @@ export function RichEditor({ node, onRenamed }: { node: ProjectNode; onRenamed: 
     if (error) { setStatus(error.message.toLowerCase().includes("rate") ? "Save paused — rate limit" : "Save failed"); return; }
     const result = data?.[0];
     if (!result?.saved) { setConflict({ revision: result.new_revision, content: result.remote_content }); setStatus("Conflict"); return; }
-    revisionRef.current = result.new_revision; setRevision(result.new_revision); setStatus("Saved");
+    revisionRef.current = result.new_revision; setRevision(result.new_revision); setStatus("Saved"); invalidateClientQuery(cacheKeyRef.current);
     if (queuedSaveRef.current) timer.current = setTimeout(() => void persist(active), 350);
   }
 
@@ -99,13 +102,29 @@ export function RichEditor({ node, onRenamed }: { node: ProjectNode; onRenamed: 
     if (!editor) return;
     loadedRef.current = false;
     const supabase = createClient();
-    const [{ data: doc, error }, { data: files }] = await Promise.all([supabase.from("documents").select("*").eq("node_id", node.id).single(), supabase.from("attachments").select("*").eq("node_id", node.id).order("created_at")]);
-    if (error) { setStatus("Load failed"); return; }
-    const typed = doc as DocumentRecord; const typedFiles = (files || []) as Attachment[];
-    revisionRef.current = typed.revision; setRevision(typed.revision); editor.commands.setContent(typed.content_json || EMPTY, { emitUpdate: false }); setAttachments(typedFiles);
-    const paths = [...new Set(typedFiles.flatMap(file => [file.storage_path, file.preview_storage_path].filter((path): path is string => Boolean(path))))];
-    if (paths.length) { const { data: urls } = await supabase.storage.from("attachments").createSignedUrls(paths, 3600); const typedUrls = (urls || []) as SignedUrl[]; setSignedUrls(Object.fromEntries(typedUrls.filter(item => item.signedUrl).map(item => [item.path || "", item.signedUrl!] as const))); } else setSignedUrls({});
-    loadedRef.current = true; setStatus("Saved");
+    const { data: { session } } = await supabase.auth.getSession();
+    const cacheKey = `editor:${session?.user.id || "anonymous"}:${node.id}`;
+    cacheKeyRef.current = cacheKey;
+    try {
+      const payload = await cachedClientQuery<EditorPayload>(cacheKey, async () => {
+        const [{ data: doc, error }, { data: files, error: filesError }] = await Promise.all([
+          supabase.from("documents").select("*").eq("node_id", node.id).single(),
+          supabase.from("attachments").select("*").eq("node_id", node.id).order("created_at"),
+        ]);
+        if (error || filesError) throw error || filesError;
+        const typedFiles = (files || []) as Attachment[];
+        const paths = [...new Set(typedFiles.flatMap(file => [file.storage_path, file.preview_storage_path].filter((path): path is string => Boolean(path))))];
+        let urlsByPath: Record<string, string> = {};
+        if (paths.length) {
+          const { data: urls } = await supabase.storage.from("attachments").createSignedUrls(paths, 3600);
+          const typedUrls = (urls || []) as SignedUrl[];
+          urlsByPath = Object.fromEntries(typedUrls.filter(item => item.signedUrl).map(item => [item.path || "", item.signedUrl!] as const));
+        }
+        return { document: doc as DocumentRecord, attachments: typedFiles, signedUrls: urlsByPath };
+      }, 10_000);
+      revisionRef.current = payload.document.revision; setRevision(payload.document.revision); editor.commands.setContent(payload.document.content_json || EMPTY, { emitUpdate: false }); setAttachments(payload.attachments); setSignedUrls(payload.signedUrls);
+      loadedRef.current = true; setStatus("Saved");
+    } catch { setStatus("Load failed"); }
   }, [node.id, editor]);
 
   useEffect(() => { void load(); return () => { loadedRef.current = false; if (timer.current) clearTimeout(timer.current); }; }, [load]);
@@ -118,7 +137,7 @@ export function RichEditor({ node, onRenamed }: { node: ProjectNode; onRenamed: 
     const validation = validateAttachment(source); if (validation) return alert(validation);
     setUploading(true); const supabase = createClient(); const uploadedPaths: string[] = [];
     try {
-      const { data: { user } } = await supabase.auth.getUser(); if (!user) throw new Error("Please sign in again.");
+      const { data: { session } } = await supabase.auth.getSession(); const user = session?.user; if (!user) throw new Error("Please sign in again.");
       const safe = source.name.replace(/[^a-zA-Z0-9._ -]/g, "_").slice(0, 180);
       const optimized = ["image/jpeg", "image/png", "image/webp"].includes(source.type) ? await optimizeImage(source) : null;
       const downloadFile = optimized?.download || source; const storedName = optimized?.download.name.replace(/[^a-zA-Z0-9._ -]/g, "_") || safe;
@@ -126,7 +145,7 @@ export function RichEditor({ node, onRenamed }: { node: ProjectNode; onRenamed: 
       const { error: uploadError } = await supabase.storage.from("attachments").upload(path, downloadFile, { contentType: downloadFile.type }); if (uploadError) throw uploadError; uploadedPaths.push(path);
       if (optimized && previewPath) { const { error: previewError } = await supabase.storage.from("attachments").upload(previewPath, optimized.preview, { contentType: "image/webp" }); if (previewError) throw previewError; uploadedPaths.push(previewPath); }
       const { data, error } = await supabase.from("attachments").insert({ owner_id: user.id, node_id: node.id, storage_path: path, preview_storage_path: previewPath, original_filename: storedName, mime_type: downloadFile.type, byte_size: downloadFile.size, preview_byte_size: optimized?.preview.size || null, original_byte_size: optimized?.originalBytes || source.size }).select().single(); if (error) throw error;
-      const row = data as Attachment; setAttachments(current => [...current, row]);
+      const row = data as Attachment; invalidateClientQuery(cacheKeyRef.current); setAttachments(current => [...current, row]);
       const { data: urls } = await supabase.storage.from("attachments").createSignedUrls(uploadedPaths, 3600); const typedUrls = (urls || []) as SignedUrl[]; const nextUrls = Object.fromEntries(typedUrls.filter(item => item.signedUrl).map(item => [item.path || "", item.signedUrl!] as const)); setSignedUrls(current => ({ ...current, ...nextUrls }));
       const inlineUrl = nextUrls[previewPath || path]; if (inlineUrl && downloadFile.type.startsWith("image/")) editor?.chain().focus().setImage({ src: inlineUrl, alt: storedName }).run();
     } catch (cause) { if (uploadedPaths.length) await supabase.storage.from("attachments").remove(uploadedPaths); alert(cause instanceof Error ? cause.message : "Upload failed."); }
@@ -134,10 +153,10 @@ export function RichEditor({ node, onRenamed }: { node: ProjectNode; onRenamed: 
   }
 
   async function downloadAttachment(file: Attachment) { const { data, error } = await createClient().storage.from("attachments").download(file.storage_path); if (error) alert(error.message); else downloadBlob(data, file.original_filename); }
-  async function removeAttachment(file: Attachment) { if (!confirm(`Remove ${file.original_filename}?`)) return; const supabase = createClient(); const paths = [file.storage_path, file.preview_storage_path].filter((path): path is string => Boolean(path)); const { error } = await supabase.storage.from("attachments").remove(paths); if (!error) { await supabase.from("attachments").delete().eq("id", file.id); setAttachments(current => current.filter(item => item.id !== file.id)); } }
+  async function removeAttachment(file: Attachment) { if (!confirm(`Remove ${file.original_filename}?`)) return; const supabase = createClient(); const paths = [file.storage_path, file.preview_storage_path].filter((path): path is string => Boolean(path)); const { error } = await supabase.storage.from("attachments").remove(paths); if (!error) { await supabase.from("attachments").delete().eq("id", file.id); invalidateClientQuery(cacheKeyRef.current); setAttachments(current => current.filter(item => item.id !== file.id)); } }
   function exportText(kind: "md" | "txt") { if (!editor) return; const content = kind === "md" ? new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" }).turndown(editor.getHTML()) : editor.getText(); downloadBlob(new Blob([content], { type: "text/plain;charset=utf-8" }), `${title}.${kind}`); }
   async function exportPdf() { if (!editor) return; const { jsPDF } = await import("jspdf"); const pdf = new jsPDF({ unit: "pt", format: "a4" }); pdf.setFont("times", "bold"); pdf.setFontSize(22); pdf.text(title, 48, 60); pdf.setFont("times", "normal"); pdf.setFontSize(11); const lines = pdf.splitTextToSize(editor.getText(), 500); let y = 88; for (const line of lines) { if (y > 790) { pdf.addPage(); y = 48; } pdf.text(line, 48, y); y += 16; } pdf.save(`${title}.pdf`); }
-  async function keepMineAsCopy() { if (!editor) return; const supabase = createClient(); const { data: { user } } = await supabase.auth.getUser(); const { data: copy, error } = await supabase.from("nodes").insert({ owner_id: user!.id, project_id: node.project_id, parent_id: node.parent_id, type: "document", name: `${title} (conflict copy)`, sort_order: node.sort_order + 1 }).select().single(); if (!error) { await supabase.from("documents").insert({ node_id: copy.id, owner_id: user!.id, content_json: editor.getJSON(), plain_text: editor.getText() }); setConflict(null); setStatus("Saved as copy"); onRenamed(); } }
+  async function keepMineAsCopy() { if (!editor) return; const supabase = createClient(); const { data: copy, error } = await supabase.from("nodes").insert({ project_id: node.project_id, parent_id: node.parent_id, type: "document", name: `${title} (conflict copy)`, sort_order: node.sort_order + 1 }).select().single(); if (!error) { await supabase.from("documents").insert({ node_id: copy.id, content_json: editor.getJSON(), plain_text: editor.getText() }); invalidateClientQuery("workspace:"); setConflict(null); setStatus("Saved as copy"); onRenamed(); } }
   function loadRemote() { if (!conflict) return; editor?.commands.setContent(conflict.content, { emitUpdate: false }); revisionRef.current = conflict.revision; setRevision(conflict.revision); setConflict(null); setStatus("Saved"); }
 
   if (!editor) return <div className="editor-wrap"><div className="skeleton" /></div>;
